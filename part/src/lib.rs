@@ -9,7 +9,7 @@ pub const BLOCK_SIZE: u64 = 512;
 #[repr(C)]
 struct Mbr {
     bootcode: [u8; 440],
-    disk_signature: U32<LE>,
+    unique_mbr_signature: U32<LE>,
     unknown: U16<LE>,
     partitions: [MbrEntry; 4],
     signature: [u8; 2],
@@ -18,16 +18,16 @@ struct Mbr {
 #[derive(Default, zerocopy::AsBytes, zerocopy::Unaligned)]
 #[repr(C)]
 struct MbrEntry {
-    boot_indicator: u8, /* unused by EFI, set to 0x80 for bootable */
-    start_head: u8,     /* unused by EFI, pt start in CHS */
-    start_sector: u8,   /* unused by EFI, pt start in CHS */
+    boot_indicator: u8,
+    start_head: u8,
+    start_sector: u8,
     start_track: u8,
-    os_type: u8,       /* EFI and legacy non-EFI OS types */
-    end_head: u8,      /* unused by EFI, pt end in CHS */
-    end_sector: u8,    /* unused by EFI, pt end in CHS */
-    end_track: u8,     /* unused by EFI, pt end in CHS */
-    starting_lba: U32<LE>, /* used by EFI - start addr of the on disk pt */
-    size_in_lba: U32<LE>,  /* used by EFI - size of pt in LBA */
+    os_type: u8,
+    end_head: u8,
+    end_sector: u8,
+    end_track: u8,
+    starting_lba: U32<LE>,
+    size_in_lba: U32<LE>,
 }
 
 const GPT_HEADER_SIGNATURE: u64 = 0x5452415020494645;
@@ -55,12 +55,12 @@ struct GptHeader {
 #[derive(zerocopy::AsBytes, zerocopy::Unaligned)]
 #[repr(C)]
 struct GptEntry {
-    partition_type_guid: [u8; 16],
-    unique_partition_guid: [u8; 16],
-    starting_lba: U64<LE>,
-    ending_lba: U64<LE>,
-    attributes: U64<LE>,
-    partition_name: [U16<LE>; 36],
+    type_guid: [u8; 16],
+    guid: [u8; 16],
+    lba_start: U64<LE>,
+    lba_end: U64<LE>,
+    attrs: U64<LE>,
+    name: [U16<LE>; 36],
 }
 
 fn calculate_crc32(data: &[u8]) -> u32 {
@@ -120,11 +120,11 @@ pub fn table_size_in_blocks(part_count: usize) -> io::Result<u64> {
 
 /// Writes the master boot record (MBR) to the given output stream.
 fn write_mbr(output: &mut (impl io::Write + io::Seek), size: u64) -> io::Result<()> {
-    output.seek(io::SeekFrom::Start(0))?;
+    output.rewind()?;
 
     let mbr = Mbr {
         bootcode: [0; 440],
-        disk_signature: 0.into(),
+        unique_mbr_signature: 0.into(),
         unknown: 0.into(),
         partitions: [
             MbrEntry {
@@ -162,12 +162,12 @@ pub fn write_table(
     let mut entries = Vec::new();
     for p in parts {
         entries.push(GptEntry {
-            partition_type_guid: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            unique_partition_guid: [0; 16],
-            starting_lba: p.start_lba.into(),
-            ending_lba: (p.start_lba + p.size_in_blocks - 1).into(),
-            attributes: 0.into(),
-            partition_name: [0.into(); 36],
+            type_guid: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            guid: [0; 16],
+            lba_start: p.start_lba.into(),
+            lba_end: (p.start_lba + p.size_in_blocks - 1).into(),
+            attrs: 0.into(),
+            name: [0.into(); 36],
         });
     }
 
@@ -213,7 +213,7 @@ pub fn write_table(
 
     // Write last byte to get the right size.
     output.seek(io::SeekFrom::Start(
-        (1 + total_size_in_blocks - 1) * BLOCK_SIZE - 1,
+        (1 + total_size_in_blocks - 1 + 1) * BLOCK_SIZE - 1,
     ))?;
     output.write_all(&[0u8; 1])?;
     Ok(())

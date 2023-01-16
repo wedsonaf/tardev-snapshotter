@@ -1,7 +1,7 @@
 use containerd_snapshots::{api, Info, Kind, Snapshotter, Usage};
 use oci_distribution::{secrets::RegistryAuth, Client, Reference, RegistryOperation};
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, fs, fs::OpenOptions, future::Future, path::Path};
+use std::{collections::HashMap, fs, fs::OpenOptions, io, io::Seek, path::Path};
 use tonic::Status;
 
 const SNAPSHOT_REF_LABEL: &str = "containerd.io/snapshot.ref";
@@ -23,17 +23,33 @@ impl TarDevSnapshotter {
         }
     }
 
+    /// Creates the snapshot image path from its name.
+    ///
+    /// If `write` is `true`, it also ensures that the directory exists.
+    fn image_path(&self, name: &str, write: bool) -> Result<String, Status> {
+        let path = format!("{}/images/{}", self.root, &name_to_hash(name));
+        if write {
+            if let Some(parent) = Path::new(&path).parent() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        Ok(path)
+    }
+
+    /// Creates the snapshot socket path from its name.
+    fn socket_path(&self, name: &str) -> Result<String, Status> {
+        let path = format!("{}/sockets/{}", self.root, &name_to_hash(name));
+        if let Some(parent) = Path::new(&path).parent() {
+            fs::create_dir_all(parent)?;
+        }
+        Ok(path)
+    }
+
     /// Creates the snapshot file path from its name.
     ///
     /// If `write` is `true`, it also ensures that the directory exists.
     fn snapshot_path(&self, name: &str, write: bool) -> Result<String, Status> {
-        let mut hasher = Sha256::new();
-        hasher.update(name);
-        let mut path = format!("{}/snapshots/", self.root);
-        for b in hasher.finalize() {
-            path += &format!("{:02x}", b);
-        }
-
+        let path = format!("{}/snapshots/{}", self.root, &name_to_hash(name));
         if write {
             if let Some(parent) = Path::new(&path).parent() {
                 fs::create_dir_all(parent)?;
@@ -74,6 +90,51 @@ impl TarDevSnapshotter {
             .map_err(|_| Status::internal("unable to write snapshot"))
     }
 
+    /// Creates a merged image with two partitions.
+    ///
+    /// The first one contains all layers followed by an index, while the second one is empty.
+    fn create_image(&self, files: &[String], path: &str) -> Result<(), Status> {
+        let mut layers = Vec::new();
+        for name in files {
+            let f = fs::File::open(&format!("{}/layers/{}", self.root, name))?;
+            layers.push(io::BufReader::new(f));
+        }
+        // TODO: BufWriter?
+        let mut out = fs::File::create(path)?;
+
+        // Leave room for the partition table at the front.
+        let prefix_size_in_blocks = part::table_size_in_blocks(2)? + 1;
+        out.seek(io::SeekFrom::Start(prefix_size_in_blocks * part::BLOCK_SIZE))?;
+
+        // Write all the layers out to the merged image.
+        for layer in &mut layers {
+            io::copy(layer, &mut out)?;
+            layer.rewind()?;
+        }
+
+        // TODO: Align to 512?
+        tarindex::build_index(&mut layers, &mut out)?;
+
+        let image_size = out.stream_position()? - prefix_size_in_blocks * part::BLOCK_SIZE;
+        let image_size_in_blocks = (image_size + part::BLOCK_SIZE - 1) / part::BLOCK_SIZE;
+
+        part::write_table(
+            &mut out,
+            &[
+                part::Descriptor {
+                    start_lba: prefix_size_in_blocks,
+                    size_in_blocks: image_size_in_blocks,
+                },
+                part::Descriptor {
+                    start_lba: prefix_size_in_blocks + image_size_in_blocks,
+                    size_in_blocks: 10 * 1024 * 1024 / part::BLOCK_SIZE,
+                },
+            ],
+        )?;
+
+        Ok(())
+    }
+
     /// Creates a new snapshot for use.
     ///
     /// It checks that the parent chain exists and that all ancestors are committed and consist of
@@ -109,13 +170,39 @@ impl TarDevSnapshotter {
             next_parent = (!info.parent.is_empty()).then_some(info.parent);
         }
 
+        parents.reverse();
         println!("Parents are: {:?}", parents);
+
+        let image_path = self.image_path(&key, true)?;
+        self.create_image(&parents, &image_path)?;
+        // TODO: Use scope guard to delete image if anything goes wrong.
+
+        println!("Image was created");
+
+        let socket = self.socket_path(&key)?;
+
+        let ret = crate::block::start_block_backend(&crate::block::VhostUserBlkBackendConfig {
+            path: &image_path,
+            socket: &socket,
+            num_queues: None,
+            queue_size: None,
+            readonly: None,
+            direct: None,
+            poll_queue: None,
+        });
+        if let Err(e) = ret {
+            println!("start_block_backend failed: {:?}", e);
+            return Err(e.into());
+        }
+
+        println!("Block backend is ready at {}", &socket);
+
+        let mounts = self.mounts_from_socket(socket)?;
 
         // Write the new snapshot.
         self.write_snapshot(kind, key, parent, labels)?;
 
-        // TODO: Get the details on how to mount it.
-        Ok(Vec::new())
+        Ok(mounts)
     }
 
     /// Creates a new snapshot for an image layer.
@@ -191,6 +278,18 @@ impl TarDevSnapshotter {
 
         Err(Status::already_exists(""))
     }
+
+    fn mounts_from_socket(&self, socket_path: String) -> Result<Vec<api::types::Mount>, Status> {
+        Ok(vec![
+           api::types::Mount {
+               // TODO: Rename this.
+               r#type: "gz-overlay".to_string(),
+               source: fs::canonicalize(&socket_path)?.to_string_lossy().into(),
+               target: String::new(),
+               options: Vec::new(),
+           },
+        ])
+    }
 }
 
 #[tonic::async_trait]
@@ -216,17 +315,8 @@ impl Snapshotter for TarDevSnapshotter {
     }
 
     async fn mounts(&self, key: String) -> Result<Vec<api::types::Mount>, Self::Error> {
-        // TODO: Implement this.
         println!("Mounts: {}", key);
-        Ok(Vec::new())
-        /*
-        Ok(vec![api::types::Mount {
-            r#type: "gz-overlay".to_string(),
-            source: "/home/wedsonaf/src/cloud-hypervisor/vhost_user_block/pause.sock".to_string(),
-            target: String::new(),
-            options: vec!["ro".to_string()],
-        }])
-        */
+        self.mounts_from_socket(self.socket_path(&key)?)
     }
 
     async fn prepare(
@@ -276,20 +366,29 @@ impl Snapshotter for TarDevSnapshotter {
         Ok(())
     }
 
-    async fn walk<F, R>(&self, mut cb: F) -> Result<(), Status>
-    where
-        F: Send + FnMut(Info) -> R,
-        R: Send + Future<Output = Result<(), Status>>,
-    {
+    type InfoStream = impl tokio_stream::Stream<Item = Result<Info, Self::Error>> + Send + 'static;
+    fn walk(&self) -> Result<Self::InfoStream, Self::Error> {
         let snapshots_dir = format!("{}/snapshots/", self.root);
-        let mut files = tokio::fs::read_dir(snapshots_dir).await?;
-        while let Some(p) = files.next_entry().await? {
-            if let Ok(f) = fs::File::open(p.path()) {
-                if let Ok(i) = serde_json::from_reader(f) {
-                    cb(i).await?;
+        Ok(async_stream::try_stream! {
+            let mut files = tokio::fs::read_dir(snapshots_dir).await?;
+            while let Some(p) = files.next_entry().await? {
+                if let Ok(f) = fs::File::open(p.path()) {
+                    if let Ok(i) = serde_json::from_reader(f) {
+                        yield i;
+                    }
                 }
             }
-        }
-        Ok(())
+        })
     }
+}
+
+/// Converts the given name to a string representation of its sha256 hash.
+fn name_to_hash(name: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(name);
+    let mut res = String::new();
+    for b in hasher.finalize() {
+        res += &format!("{:02x}", b);
+    }
+    res
 }

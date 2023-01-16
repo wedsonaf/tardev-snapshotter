@@ -1,21 +1,28 @@
+#![feature(type_alias_impl_trait)]
+
 use containerd_snapshots::server;
 use snapshotter::TarDevSnapshotter;
 use std::{env, process, sync::Arc};
 use tokio::net::UnixListener;
 use tonic::transport::Server;
 
+mod block;
 mod snapshotter;
 
 #[tokio::main]
 pub async fn main() {
     let argv: Vec<String> = env::args().collect();
     if argv.len() != 3 {
-        eprintln!("Usage: {} <listen-socket-name> <data-root-path>", argv[0]);
+        eprintln!("Usage: {} <data-root-path> [listen-socket-name]", argv[0]);
         process::exit(1);
     }
 
+    // TODO: Add support for getting the listening socket
+
+    // TODO: Check that the directory is accessible.
+
     let incoming = {
-        let uds = match UnixListener::bind(&argv[1]) {
+        let uds = match UnixListener::bind(&argv[2]) {
             Ok(l) => l,
             Err(e) => {
                 eprintln!("UnixListener::bind failed: {:?}", e);
@@ -32,7 +39,7 @@ pub async fn main() {
     };
 
     if let Err(e) = Server::builder()
-        .add_service(server(Arc::new(TarDevSnapshotter::new(&argv[2]))))
+        .add_service(server(Arc::new(TarDevSnapshotter::new(&argv[1]))))
         .serve_with_incoming(incoming)
         .await
     {
