@@ -2,7 +2,7 @@
 
 use containerd_snapshots::server;
 use snapshotter::TarDevSnapshotter;
-use std::{env, process, sync::Arc};
+use std::{env, path::Path, process, sync::Arc};
 use tokio::net::UnixListener;
 use tonic::transport::Server;
 
@@ -38,7 +38,9 @@ pub async fn main() {
     };
 
     if let Err(e) = Server::builder()
-        .add_service(server(Arc::new(TarDevSnapshotter::new(&argv[1]))))
+        .add_service(server(Arc::new(TarDevSnapshotter::new(Path::new(
+            &argv[1],
+        )))))
         .serve_with_incoming(incoming)
         .await
     {

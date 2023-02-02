@@ -1,7 +1,8 @@
 use containerd_snapshots::{api, Info, Kind, Snapshotter, Usage};
 use oci_distribution::{secrets::RegistryAuth, Client, Reference, RegistryOperation};
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, fs, fs::OpenOptions, io, io::Seek, path::Path};
+use std::path::{Path, PathBuf};
+use std::{collections::HashMap, fs, fs::OpenOptions, io, io::Seek};
 use tonic::Status;
 
 const SNAPSHOT_REF_LABEL: &str = "containerd.io/snapshot.ref";
@@ -9,29 +10,26 @@ const TARGET_LAYER_DIGEST_LABEL: &str = "containerd.io/snapshot/cri.layer-digest
 const TARGET_REF_LABEL: &str = "containerd.io/snapshot/cri.image-ref";
 
 // TODO: We need to serialize access to storage to prevent data races.
-// TODO: Use PathBuf instead of string for this.
 /// The snapshotter that creates tar devices.
 pub(crate) struct TarDevSnapshotter {
-    root: String,
+    root: PathBuf,
 }
 
 impl TarDevSnapshotter {
     /// Creates a new instance of the snapshotter.
     ///
     /// `root` is the root directory where the snapshotter state is to be stored.
-    pub(crate) fn new(root: &str) -> Self {
-        Self {
-            root: root.to_string(),
-        }
+    pub(crate) fn new(root: &Path) -> Self {
+        Self { root: root.into() }
     }
 
     /// Creates the snapshot file path from its name.
     ///
     /// If `write` is `true`, it also ensures that the directory exists.
-    fn snapshot_path(&self, name: &str, write: bool) -> Result<String, Status> {
-        let path = format!("{}/snapshots/{}", self.root, &name_to_hash(name));
+    fn snapshot_path(&self, name: &str, write: bool) -> Result<PathBuf, Status> {
+        let path = self.root.join("snapshots").join(name_to_hash(name));
         if write {
-            if let Some(parent) = Path::new(&path).parent() {
+            if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)?;
             }
         }
@@ -42,10 +40,10 @@ impl TarDevSnapshotter {
     /// Creates the layer file path from its name.
     ///
     /// If `write` is `true`, it also ensures that the directory exists.
-    fn layer_path(&self, name: &str, write: bool) -> Result<String, Status> {
-        let path = format!("{}/layers/{}", self.root, &name_to_hash(&name));
+    fn layer_path(&self, name: &str, write: bool) -> Result<PathBuf, Status> {
+        let path = self.root.join("layers").join(name_to_hash(name));
         if write {
-            if let Some(parent) = Path::new(&path).parent() {
+            if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)?;
             }
         }
@@ -143,8 +141,9 @@ impl TarDevSnapshotter {
 
             // TODO: Eventually when we have the layer reference-count, switch to use `digest_str`
             // here.
-            let name = self.layer_path(&key, true)? + ".gz";
-            println!("Downloading to {}", &name);
+            let mut name = self.layer_path(&key, true)?;
+            name.set_extension("gz");
+            println!("Downloading to {:?}", &name);
             {
                 let mut file = tokio::fs::File::create(&name).await?;
                 if let Err(err) = client.pull_blob(&reference, digest_str, &mut file).await {
@@ -170,7 +169,7 @@ impl TarDevSnapshotter {
             }
 
             // TODO: Use file that is already opened once the previous TODO is fixed.
-            let name = &name[..name.len() - 3];
+            name.set_extension("");
             let mut file = OpenOptions::new().read(true).write(true).open(name)?;
             tarindex::append_index(&mut file)?;
         }
@@ -201,7 +200,7 @@ impl TarDevSnapshotter {
 
         Ok(vec![api::types::Mount {
             r#type: "tar-overlay".to_string(),
-            source: format!("{}/layers", self.root),
+            source: self.root.join("layers").to_string_lossy().into_owned(),
             target: String::new(),
             options: parents,
         }])
@@ -323,7 +322,7 @@ impl Snapshotter for TarDevSnapshotter {
 
     type InfoStream = impl tokio_stream::Stream<Item = Result<Info, Self::Error>> + Send + 'static;
     fn walk(&self) -> Result<Self::InfoStream, Self::Error> {
-        let snapshots_dir = format!("{}/snapshots/", self.root);
+        let snapshots_dir = self.root.join("snapshots");
         Ok(async_stream::try_stream! {
             let mut files = tokio::fs::read_dir(snapshots_dir).await?;
             while let Some(p) = files.next_entry().await? {
