@@ -93,12 +93,14 @@ fn visit_breadth_first_mut(
     Ok(())
 }
 
+// TODO: Handle white-outs.
+// https://www.kernel.org/doc/Documentation/filesystems/overlayfs.txt contains information about
+// how overlayfs handles this.
 fn read_all_entries(
     reader: &mut (impl io::Read + io::Seek),
-    offset: u64,
     root: &mut Rc<RefCell<Entry>>,
-    cb: &mut impl FnMut(&mut Rc<RefCell<Entry>>, &[u8], &Entry),
-    hardlink: &mut impl FnMut(&mut Rc<RefCell<Entry>>, &[u8], &[u8]),
+    mut cb: impl FnMut(&mut Rc<RefCell<Entry>>, &[u8], &Entry),
+    mut hardlink: impl FnMut(&mut Rc<RefCell<Entry>>, &[u8], &[u8]),
 ) -> io::Result<u64> {
     let mut ar = Archive::new(reader);
 
@@ -120,7 +122,7 @@ fn read_all_entries(
             tar::EntryType::Regular => {
                 mode |= S_IFREG;
                 entry_size = f.size();
-                entry_offset = offset + f.raw_file_position();
+                entry_offset = f.raw_file_position();
             }
             tar::EntryType::Directory => {
                 mode |= S_IFDIR;
@@ -146,7 +148,7 @@ fn read_all_entries(
                         }
 
                         entry_size = name.len() as u64;
-                        entry_offset = offset + f.raw_header_position() + 157;
+                        entry_offset = f.raw_header_position() + 157;
                     }
                     None => {
                         eprintln!(
@@ -159,7 +161,7 @@ fn read_all_entries(
             }
             tar::EntryType::Link => {
                 match f.link_name_bytes() {
-                    Some(name) => (*hardlink)(root, &f.path_bytes(), &name),
+                    Some(name) => hardlink(root, &f.path_bytes(), &name),
                     None => {
                         eprintln!(
                             "Skipping hardlink without a link name: {}",
@@ -179,7 +181,7 @@ fn read_all_entries(
             }
         }
 
-        (*cb)(
+        cb(
             root,
             &f.path_bytes(),
             &Entry {
@@ -223,22 +225,6 @@ fn clean_path(str: &[u8]) -> Option<Vec<&[u8]>> {
     }
 
     Some(ret)
-}
-
-/// Reads the contents of all tar files.
-///
-/// It returns a `Vec` with all entries plus sum of the sizes of all files.
-fn read_all_files(
-    inputs: &mut [impl io::Read + io::Seek],
-    root: &mut Rc<RefCell<Entry>>,
-    mut f: impl FnMut(&mut Rc<RefCell<Entry>>, &[u8], &Entry),
-    mut hardlink_f: impl FnMut(&mut Rc<RefCell<Entry>>, &[u8], &[u8]),
-) -> io::Result<u64> {
-    let mut contents_size = 0u64;
-    for input in inputs {
-        contents_size += read_all_entries(input, contents_size, root, &mut f, &mut hardlink_f)?;
-    }
-    Ok(contents_size)
 }
 
 /// Initilises the `offset` of all `Entry` instances that represent directories.
@@ -301,17 +287,14 @@ fn write_direntry_bodies(
     Ok(offset)
 }
 
-pub fn build_index(
-    input: &mut [impl io::Read + io::Seek],
-    output: &mut impl io::Write,
-) -> io::Result<()> {
+pub fn append_index(data: &mut (impl io::Read + io::Write + io::Seek)) -> io::Result<()> {
     let mut root = Rc::new(RefCell::new(Entry {
         mode: S_IFDIR | 0o555,
         ..Entry::default()
     }));
 
-    let contents_size = read_all_files(
-        input,
+    let contents_size = read_all_entries(
+        data,
         &mut root,
         |root, name, e| {
             // Break the name into path components.
@@ -392,6 +375,8 @@ pub fn build_index(
         },
     )?;
 
+    data.seek(io::SeekFrom::End(0))?;
+
     // Assign i-node numbers only for the entries that survided conversion to tree.
     let mut ino_count = 0u64;
     visit_breadth_first_mut(root.clone(), |e| {
@@ -423,12 +408,12 @@ pub fn build_index(
             size: e.size.into(),
             offset: e.offset.into(), // TODO: Handle the dev case and encode minor/major instead.
         };
-        output.write_all(inode.as_bytes())?;
+        data.write_all(inode.as_bytes())?;
         Ok(())
     })?;
 
     // Write the directory bodies.
-    let end_offset = write_direntry_bodies(root.clone(), string_table_offset, output)?;
+    let end_offset = write_direntry_bodies(root.clone(), string_table_offset, data)?;
 
     // Write the strings.
     visit_breadth_first_mut(root, |e| {
@@ -437,7 +422,7 @@ pub fn build_index(
         }
 
         for name in e.children.keys() {
-            output.write_all(name)?;
+            data.write_all(name)?;
         }
 
         Ok(())
@@ -445,7 +430,7 @@ pub fn build_index(
 
     // Write padding to align to the 512-byte boundary.
     for _ in 0..((512 - end_offset % 512) % 512) {
-        output.write_all(&[0])?;
+        data.write_all(&[0])?;
     }
 
     // Write the "super-block".
@@ -453,11 +438,11 @@ pub fn build_index(
         inode_table_offset: contents_size.into(),
         inode_count: ino_count.into(),
     };
-    output.write_all(sb.as_bytes())?;
+    data.write_all(sb.as_bytes())?;
 
     // Write padding to align to the 512-byte boundary.
     for _ in 0..((512 - mem::size_of::<SuperBlock>() % 512) % 512) {
-        output.write_all(&[0])?;
+        data.write_all(&[0])?;
     }
 
     Ok(())

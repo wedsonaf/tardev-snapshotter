@@ -1,13 +1,15 @@
 use containerd_snapshots::{api, Info, Kind, Snapshotter, Usage};
 use oci_distribution::{secrets::RegistryAuth, Client, Reference, RegistryOperation};
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, fs, fs::OpenOptions, future::Future, path::Path};
+use std::{collections::HashMap, fs, fs::OpenOptions, io, io::Seek, path::Path};
 use tonic::Status;
 
 const SNAPSHOT_REF_LABEL: &str = "containerd.io/snapshot.ref";
 const TARGET_LAYER_DIGEST_LABEL: &str = "containerd.io/snapshot/cri.layer-digest";
 const TARGET_REF_LABEL: &str = "containerd.io/snapshot/cri.image-ref";
 
+// TODO: We need to serialize access to storage to prevent data races.
+// TODO: Use PathBuf instead of string for this.
 /// The snapshotter that creates tar devices.
 pub(crate) struct TarDevSnapshotter {
     root: String,
@@ -27,13 +29,21 @@ impl TarDevSnapshotter {
     ///
     /// If `write` is `true`, it also ensures that the directory exists.
     fn snapshot_path(&self, name: &str, write: bool) -> Result<String, Status> {
-        let mut hasher = Sha256::new();
-        hasher.update(name);
-        let mut path = format!("{}/snapshots/", self.root);
-        for b in hasher.finalize() {
-            path += &format!("{:02x}", b);
+        let path = format!("{}/snapshots/{}", self.root, &name_to_hash(name));
+        if write {
+            if let Some(parent) = Path::new(&path).parent() {
+                fs::create_dir_all(parent)?;
+            }
         }
 
+        Ok(path)
+    }
+
+    /// Creates the layer file path from its name.
+    ///
+    /// If `write` is `true`, it also ensures that the directory exists.
+    fn layer_path(&self, name: &str, write: bool) -> Result<String, Status> {
+        let path = format!("{}/layers/{}", self.root, &name_to_hash(&name));
         if write {
             if let Some(parent) = Path::new(&path).parent() {
                 fs::create_dir_all(parent)?;
@@ -85,42 +95,15 @@ impl TarDevSnapshotter {
         parent: String,
         labels: HashMap<String, String>,
     ) -> Result<Vec<api::types::Mount>, Status> {
-        // Get chain of parents.
-        let mut next_parent = Some(parent.clone());
-        let mut parents = Vec::new();
-        while let Some(p) = next_parent {
-            println!("About to try to read {}", &p);
-            let info = self.read_snapshot(&p)?;
-            if info.kind != Kind::Committed {
-                return Err(Status::failed_precondition(
-                    "parent snapshot is not committed",
-                ));
-            }
-
-            match info.labels.get(TARGET_LAYER_DIGEST_LABEL) {
-                Some(digest) => parents.push(digest.clone()),
-                None => {
-                    return Err(Status::failed_precondition(
-                        "parent snapshot missing digest",
-                    ))
-                }
-            }
-
-            next_parent = (!info.parent.is_empty()).then_some(info.parent);
-        }
-
-        println!("Parents are: {:?}", parents);
-
-        // Write the new snapshot.
+        let mounts = self.mounts_from_snapshot(&parent)?;
         self.write_snapshot(kind, key, parent, labels)?;
-
-        // TODO: Get the details on how to mount it.
-        Ok(Vec::new())
+        Ok(mounts)
     }
 
     /// Creates a new snapshot for an image layer.
     ///
-    /// It downloads and decompresses the layer before writing the new snapshot.
+    /// It downloads, decompresses, and creates the index for the layer before writing the new
+    /// snapshot.
     async fn prepare_image_layer(
         &self,
         key: String,
@@ -158,24 +141,25 @@ impl TarDevSnapshotter {
                 .await
                 .map_err(|_| Status::internal("unable to authenticate"))?;
 
-            let name = format!("{}/layers/{}.gz", self.root, digest_str);
-            if let Some(parent) = Path::new(&name).parent() {
-                fs::create_dir_all(parent)?;
-            }
-
+            // TODO: Eventually when we have the layer reference-count, switch to use `digest_str`
+            // here.
+            let name = self.layer_path(&key, true)? + ".gz";
             println!("Downloading to {}", &name);
-            let mut file = tokio::fs::File::create(&name).await?;
-            if let Err(err) = client.pull_blob(&reference, digest_str, &mut file).await {
-                drop(file);
-                println!("Download failed: {:?}", err);
-                let _ = fs::remove_file(&name);
-                return Err(Status::unknown("unable to pull blob"));
+            {
+                let mut file = tokio::fs::File::create(&name).await?;
+                if let Err(err) = client.pull_blob(&reference, digest_str, &mut file).await {
+                    drop(file);
+                    println!("Download failed: {:?}", err);
+                    let _ = fs::remove_file(&name);
+                    return Err(Status::unknown("unable to pull blob"));
+                }
             }
 
             // TODO: Decompress in stream instead of doing this.
             // Decompress data.
             if !tokio::process::Command::new("gunzip")
-                .arg(&name[..name.len() - 3])
+                .arg(&name)
+                .arg("-f")
                 .spawn()?
                 .wait()
                 .await?
@@ -184,12 +168,43 @@ impl TarDevSnapshotter {
                 let _ = fs::remove_file(&name);
                 return Err(Status::unknown("unable to decompress layer"));
             }
+
+            // TODO: Use file that is already opened once the previous TODO is fixed.
+            let name = &name[..name.len() - 3];
+            let mut file = OpenOptions::new().read(true).write(true).open(name)?;
+            tarindex::append_index(&mut file)?;
         }
 
-        // TODO: Check existence of parent.
         self.write_snapshot(Kind::Committed, key, parent, labels)?;
 
         Err(Status::already_exists(""))
+    }
+
+    fn mounts_from_snapshot(&self, parent: &str) -> Result<Vec<api::types::Mount>, Status> {
+        // Get chain of parents.
+        let mut next_parent = Some(parent.to_string());
+        let mut parents = Vec::new();
+        while let Some(p) = next_parent {
+            let info = self.read_snapshot(&p)?;
+            if info.kind != Kind::Committed {
+                return Err(Status::failed_precondition(
+                    "parent snapshot is not committed",
+                ));
+            }
+
+            parents.push(name_to_hash(&p));
+
+            next_parent = (!info.parent.is_empty()).then_some(info.parent);
+        }
+
+        parents.reverse();
+
+        Ok(vec![api::types::Mount {
+            r#type: "tar-overlay".to_string(),
+            source: format!("{}/layers", self.root),
+            target: String::new(),
+            options: parents,
+        }])
     }
 }
 
@@ -210,23 +225,33 @@ impl Snapshotter for TarDevSnapshotter {
     }
 
     async fn usage(&self, key: String) -> Result<Usage, Self::Error> {
-        // TODO: Implement this.
         println!("Usage: {}", key);
-        Ok(Usage::default())
+
+        let info = self.read_snapshot(&key)?;
+        if info.kind != Kind::Committed {
+            // Only committed snapshots consume storage.
+            return Ok(Usage { inodes: 0, size: 0 });
+        }
+
+        let mut file = fs::File::open(self.layer_path(&key, false)?)?;
+        let len = file.seek(io::SeekFrom::End(0))?;
+        Ok(Usage {
+            // TODO: Read the index "header" to determine the inode count.
+            inodes: 1,
+            size: len as _,
+        })
     }
 
     async fn mounts(&self, key: String) -> Result<Vec<api::types::Mount>, Self::Error> {
-        // TODO: Implement this.
         println!("Mounts: {}", key);
-        Ok(Vec::new())
-        /*
-        Ok(vec![api::types::Mount {
-            r#type: "gz-overlay".to_string(),
-            source: "/home/wedsonaf/src/cloud-hypervisor/vhost_user_block/pause.sock".to_string(),
-            target: String::new(),
-            options: vec!["ro".to_string()],
-        }])
-        */
+        let info = self.read_snapshot(&key)?;
+        if info.kind != Kind::View && info.kind != Kind::Active {
+            return Err(Status::failed_precondition(
+                "parent snapshot is not active nor a view",
+            ));
+        }
+
+        self.mounts_from_snapshot(&info.parent)
     }
 
     async fn prepare(
@@ -271,25 +296,54 @@ impl Snapshotter for TarDevSnapshotter {
 
     async fn remove(&self, key: String) -> Result<(), Self::Error> {
         println!("Remove: {}", key);
-        let name = self.snapshot_path(&key, false)?;
-        fs::remove_file(name)?;
-        Ok(())
-    }
 
-    async fn walk<F, R>(&self, mut cb: F) -> Result<(), Status>
-    where
-        F: Send + FnMut(Info) -> R,
-        R: Send + Future<Output = Result<(), Status>>,
-    {
-        let snapshots_dir = format!("{}/snapshots/", self.root);
-        let mut files = tokio::fs::read_dir(snapshots_dir).await?;
-        while let Some(p) = files.next_entry().await? {
-            if let Ok(f) = fs::File::open(p.path()) {
-                if let Ok(i) = serde_json::from_reader(f) {
-                    cb(i).await?;
+        if let Ok(info) = self.read_snapshot(&key) {
+            if info.kind == Kind::Committed {
+                if let Some(_digest) = info.labels.get(TARGET_LAYER_DIGEST_LABEL) {
+                    // Try to delete a layer. It's ok if it's not found.
+                    // TODO: We need to ref-count the layer file so that we don't remove it here
+                    // when the first reference goes away. For now we're using the snapshot name
+                    // as the layer name, but eventually we want to use `digest`.
+                    if let Ok(layer_path) = self.layer_path(&key, false) {
+                        if let Err(e) = fs::remove_file(layer_path) {
+                            if e.kind() != io::ErrorKind::NotFound {
+                                return Err(e.into());
+                            }
+                        }
+                    }
                 }
             }
         }
+
+        let name = self.snapshot_path(&key, false)?;
+        fs::remove_file(name)?;
+
         Ok(())
     }
+
+    type InfoStream = impl tokio_stream::Stream<Item = Result<Info, Self::Error>> + Send + 'static;
+    fn walk(&self) -> Result<Self::InfoStream, Self::Error> {
+        let snapshots_dir = format!("{}/snapshots/", self.root);
+        Ok(async_stream::try_stream! {
+            let mut files = tokio::fs::read_dir(snapshots_dir).await?;
+            while let Some(p) = files.next_entry().await? {
+                if let Ok(f) = fs::File::open(p.path()) {
+                    if let Ok(i) = serde_json::from_reader(f) {
+                        yield i;
+                    }
+                }
+            }
+        })
+    }
+}
+
+/// Converts the given name to a string representation of its sha256 hash.
+fn name_to_hash(name: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(name);
+    let mut res = String::new();
+    for b in hasher.finalize() {
+        res += &format!("{:02x}", b);
+    }
+    res
 }
