@@ -16,3 +16,4 @@ sha2 = "0.10.6"
 tarindex = { path = "./tarindex" }
 log = "0.4.17"
 env_logger = "0.10.0"
+tempfile = "3.3.0"
