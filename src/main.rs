@@ -1,6 +1,7 @@
 #![feature(type_alias_impl_trait)]
 
 use containerd_snapshots::server;
+use log::{error, info};
 use snapshotter::TarDevSnapshotter;
 use std::{env, path::Path, process, sync::Arc};
 use tokio::net::UnixListener;
@@ -10,9 +11,11 @@ mod snapshotter;
 
 #[tokio::main]
 pub async fn main() {
+    env_logger::init();
+
     let argv: Vec<String> = env::args().collect();
     if argv.len() != 3 {
-        eprintln!("Usage: {} <data-root-path> [listen-socket-name]", argv[0]);
+        error!("Usage: {} <data-root-path> [listen-socket-name]", argv[0]);
         process::exit(1);
     }
 
@@ -24,7 +27,7 @@ pub async fn main() {
         let uds = match UnixListener::bind(&argv[2]) {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("UnixListener::bind failed: {:?}", e);
+                error!("UnixListener::bind failed: {:?}", e);
                 process::exit(1);
             }
         };
@@ -37,6 +40,7 @@ pub async fn main() {
         }
     };
 
+    info!("Snapshotter started");
     if let Err(e) = Server::builder()
         .add_service(server(Arc::new(TarDevSnapshotter::new(Path::new(
             &argv[1],
@@ -44,7 +48,7 @@ pub async fn main() {
         .serve_with_incoming(incoming)
         .await
     {
-        eprintln!("serve_with_incoming failed: {:?}", e);
+        error!("serve_with_incoming failed: {:?}", e);
         process::exit(1);
     }
 }

@@ -1,4 +1,5 @@
 use containerd_snapshots::{api, Info, Kind, Snapshotter, Usage};
+use log::{debug, trace};
 use oci_distribution::{secrets::RegistryAuth, Client, Reference, RegistryOperation};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -143,12 +144,12 @@ impl TarDevSnapshotter {
             // here.
             let mut name = self.layer_path(&key, true)?;
             name.set_extension("gz");
-            println!("Downloading to {:?}", &name);
+            trace!("Downloading to {:?}", &name);
             {
                 let mut file = tokio::fs::File::create(&name).await?;
                 if let Err(err) = client.pull_blob(&reference, digest_str, &mut file).await {
                     drop(file);
-                    println!("Download failed: {:?}", err);
+                    debug!("Download failed: {:?}", err);
                     let _ = fs::remove_file(&name);
                     return Err(Status::unknown("unable to pull blob"));
                 }
@@ -212,19 +213,21 @@ impl Snapshotter for TarDevSnapshotter {
     type Error = Status;
 
     async fn stat(&self, key: String) -> Result<Info, Self::Error> {
+        trace!("stat({})", key);
         self.read_snapshot(&key)
     }
 
     async fn update(
         &self,
-        _info: Info,
-        _fieldpaths: Option<Vec<String>>,
+        info: Info,
+        fieldpaths: Option<Vec<String>>,
     ) -> Result<Info, Self::Error> {
+        trace!("update({:?}, {:?})", info, fieldpaths);
         Err(Status::unimplemented("no support for updating snapshots"))
     }
 
     async fn usage(&self, key: String) -> Result<Usage, Self::Error> {
-        println!("Usage: {}", key);
+        trace!("usage({})", key);
 
         let info = self.read_snapshot(&key)?;
         if info.kind != Kind::Committed {
@@ -242,7 +245,7 @@ impl Snapshotter for TarDevSnapshotter {
     }
 
     async fn mounts(&self, key: String) -> Result<Vec<api::types::Mount>, Self::Error> {
-        println!("Mounts: {}", key);
+        trace!("mounts({})", key);
         let info = self.read_snapshot(&key)?;
         if info.kind != Kind::View && info.kind != Kind::Active {
             return Err(Status::failed_precondition(
@@ -259,10 +262,7 @@ impl Snapshotter for TarDevSnapshotter {
         parent: String,
         labels: HashMap<String, String>,
     ) -> Result<Vec<api::types::Mount>, Status> {
-        println!(
-            "Prepare: key={}, parent={}, labels={:?}",
-            key, parent, labels
-        );
+        trace!("mounts({}, {}, {:?})", key, parent, labels);
 
         // There are two reasons for preparing a snapshot: to build an image and to actually use it
         // as a container image. We determine the reason by the presence of the snapshot-ref label.
@@ -280,21 +280,22 @@ impl Snapshotter for TarDevSnapshotter {
         parent: String,
         labels: HashMap<String, String>,
     ) -> Result<Vec<api::types::Mount>, Self::Error> {
-        println!("View: key={}, parent={}, labels={:?}", key, parent, labels);
+        trace!("view({}, {}, {:?})", key, parent, labels);
         self.prepare_snapshot_for_use(Kind::View, key, parent, labels)
     }
 
     async fn commit(
         &self,
-        _name: String,
-        _key: String,
-        _labels: HashMap<String, String>,
+        name: String,
+        key: String,
+        labels: HashMap<String, String>,
     ) -> Result<(), Self::Error> {
+        trace!("commit({}, {}, {:?})", name, key, labels);
         Err(Status::unimplemented("no support for commiting snapshots"))
     }
 
     async fn remove(&self, key: String) -> Result<(), Self::Error> {
-        println!("Remove: {}", key);
+        trace!("remove({})", key);
 
         if let Ok(info) = self.read_snapshot(&key) {
             if info.kind == Kind::Committed {
@@ -322,6 +323,7 @@ impl Snapshotter for TarDevSnapshotter {
 
     type InfoStream = impl tokio_stream::Stream<Item = Result<Info, Self::Error>> + Send + 'static;
     fn walk(&self) -> Result<Self::InfoStream, Self::Error> {
+        trace!("walk()");
         let snapshots_dir = self.root.join("snapshots");
         Ok(async_stream::try_stream! {
             let mut files = tokio::fs::read_dir(snapshots_dir).await?;
