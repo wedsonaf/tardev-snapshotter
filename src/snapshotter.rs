@@ -372,9 +372,5 @@ impl Snapshotter for TarDevSnapshotter {
 fn name_to_hash(name: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(name);
-    let mut res = String::new();
-    for b in hasher.finalize() {
-        res += &format!("{:02x}", b);
-    }
-    res
+    format!("{:x}", hasher.finalize())
 }
